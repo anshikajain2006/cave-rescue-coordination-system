@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+
+# Local mission records created by the app at runtime
+missions.db
