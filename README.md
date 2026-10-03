@@ -263,16 +263,4 @@ The full list of properties, responses and known failure modes is in [SAFETY.md]
 
 ---
 
-## Recording the demo GIF
 
-1. Start the app: `streamlit run app.py`, then open http://localhost:8501 in your browser.
-2. Leave the **OpenAI API key** field empty, so no key appears in the recording.
-3. In the sidebar, **untick "Use SMT Verifier"**, so the flooded Lower Sump is reachable and all three survivors can
-   be found. (If a run ends with 2/3, press **Reset mission** and run again.)
-4. Scroll so that the sidebar's **Autonomous Mission** section and the live panel above the tabs are both visible.
-5. Start your screen recorder (for example ScreenToGif or ShareX on Windows, Kap on macOS, Peek on Linux), set to
-   capture **only the browser window**, cropped to the page content.
-6. Click **Run Autonomous Mission** and record until the panel shows **COMPLETE**. Then open the **Cave Map** tab
-   for a second or two to show the final routes.
-7. Export as a GIF (about 10–15 fps and 1000–1200 px wide keeps it under ~10 MB), save it as `demo.gif` in the
-   repository root, and commit it. The image link at the top of this README will then show it automatically.
