@@ -10,9 +10,9 @@ confidence, picks the next chamber. Q-learning drives there, each sonar sweep up
 to base before its battery runs out. An MDP pilot (policy/value iteration) proposes detours when a route is blocked.
 Every mission is logged to SQLite and shown on a Streamlit dashboard.
 
-![Demo](demo.gif)
+![Demo: autonomous mission, conflict rerouting and the MDP pilot](demo.gif)
 
-> `demo.gif` is not recorded yet — see [Recording the demo GIF](#recording-the-demo-gif).
+*Demo at 6× speed. Full-length recording (4 min): [demo.mp4](demo.mp4)*
 
 ---
 
@@ -87,24 +87,6 @@ ASCII view of one autonomous cycle:
 | `planner.py` | A* search (Manhattan or Euclidean heuristic) over the grid. |
 | `eval.py` | Runs N headless autonomous missions with different seeds and writes `eval_results.csv` plus a summary. |
 | `test_flow.py` | End-to-end test script (18 checks, see [Tests](#tests)). |
-
-### Lab modules reused by the system
-
-| File | What it does |
-|---|---|
-| `environment.py` | `SurgicalLabEnvironment` grid base class (distance heuristics, obstacles) that `CaveEnvironment` extends. |
-| `hmm_environment.py` | `WarehouseHMMEnvironment`: grid → HMM states, transition tensor and sonar emission matrix. |
-| `hmm_filter.py` | `HMMStateEstimator`: Bayesian predict/update filter. |
-| `policy_engine.py` | Common `PolicyEngine.solve(P, R, discount)` interface. |
-| `policy_iteration_lab.py` | Policy iteration engine used by the MDP pilot. |
-| `value_iteration_lab.py` | Value iteration engine used by the MDP pilot. |
-
-### Unused leftovers (not imported by the system)
-
-| File | What it is |
-|---|---|
-| `env.py`, `mdp_builder.py` | Treasure-hunt MDP lab environment and tensor builder; the cave builds its own tensors in `cave_mdp.py`. |
-| `environment (2).py` | Byte-identical duplicate of `environment.py`. |
 
 ---
 
@@ -260,7 +242,3 @@ shows the bot's new route dashed.
 - **Localisation gate.** UNIT-01 may not navigate while its position belief is too uncertain; it must scan first.
 
 The full list of properties, responses and known failure modes is in [SAFETY.md](SAFETY.md).
-
----
-
-
