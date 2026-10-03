@@ -87,7 +87,7 @@ CONFLICT_COLOR = '#a0522d'
 LOW_BATTERY_FRACTION = 0.3
 MINUTES_PER_MOVE = 0.1          # Same drain rate run_command applies to the battery
 AUTO_ARMS = range(1, 10)        # Chambers the autonomous search can choose (C0 is the entrance)
-AUTO_MAX_CYCLES = 20            # Hard stop, so a run of unlucky sonar misses cannot loop for ever
+AUTO_MAX_CYCLES = 30            # Hard stop, so a run of unlucky sonar misses cannot loop for ever
 AUTO_STEP_DELAY_S = 0.8         # Pause after each phase so the run can be followed on screen
 AUTO_EXHAUSTED_MEAN = 0.2       # Stop once every chamber still in play has a posterior mean below this
 AUTO_HOME = CHAMBER_MAP[0]      # Base the bot must always keep enough battery to return to
@@ -747,6 +747,8 @@ def run_autonomous_mission(phase_slot, detail_slot, table_slot):
             end_reason = "all survivors found"
             break
         if cycle >= AUTO_MAX_CYCLES:
+            log(f"AUTO [{cycle}]: cycle limit ({AUTO_MAX_CYCLES}) reached — returning to base")
+            return_to_base(cycle)
             end_reason = f"cycle limit ({AUTO_MAX_CYCLES}) reached"
             break
         if bot.battery < MINUTES_PER_MOVE:  # Cannot make even one more move
