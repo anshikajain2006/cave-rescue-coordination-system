@@ -18,7 +18,8 @@ from matplotlib.patches import Rectangle
 
 import llm_parser
 import react_parser
-from autonomous_mission import DETECTION_PROB, QLearningNavigator, ThompsonBandit, scan_detects_survivor
+from autonomous_mission import (DETECTION_PROB, HMMCoupling, QLearningNavigator, ThompsonBandit,
+                                scan_detects_survivor)
 from cave_db import MissionDatabase
 from cave_environment import CaveEnvironment, RescueBot, create_fleet, get_wall_observation
 from cave_mdp import CaveMDPPilot
@@ -683,8 +684,8 @@ def run_autonomous_mission(phase_slot, detail_slot, table_slot):
     ss.last_bot = HMM_BOT
     ss.parse_trace = []
     rng = np.random.default_rng()
-    bandit = ThompsonBandit(AUTO_ARMS, rng)
     navigator = get_navigator()
+    bandit = ThompsonBandit(AUTO_ARMS, rng, hmm=HMMCoupling(synced_localiser, navigator, CHAMBER_MAP))
     survivors = set(cave.survivor_locations)
     found = set()
     log(f"AUTO: mission start — {HMM_BOT} at {bot.position}, battery {bot.battery:.1f} min, "
@@ -774,9 +775,12 @@ def run_autonomous_mission(phase_slot, detail_slot, table_slot):
                 break
             target = CHAMBER_MAP[arm]
             sample, mean, std = bandit.last_samples[arm], bandit.mean(arm), bandit.std(arm)
+            reach = bandit.last_weights[arm]
             show('SCANNING', cycle, f"Thompson sampling picked **C{arm} {CHAMBER_NAMES[arm]}** — sampled "
-                                    f"{sample:.2f} from its posterior (mean {mean:.2f} ± {std:.2f}).")
-            log(f"AUTO [{cycle}]: bandit picked C{arm} (sample {sample:.2f}, mean {mean:.2f}, std {std:.2f})")
+                                    f"{sample:.2f} from its posterior (mean {mean:.2f} ± {std:.2f}) × "
+                                    f"HMM reach weight {reach:.2f}.")
+            log(f"AUTO [{cycle}]: bandit picked C{arm} (sample {sample:.2f} x reach {reach:.2f}, "
+                f"mean {mean:.2f}, std {std:.2f})")
             route = navigator.route(bot.position, target)
             if not route:
                 bandit.retire(arm, 'unreachable')
@@ -829,7 +833,8 @@ def run_autonomous_mission(phase_slot, detail_slot, table_slot):
             bandit.retire(arm, 'survivor rescued')
         outcome = (f"SURVIVOR FOUND at C{arm} ({len(found)}/{len(survivors)}) — reward 1, posterior raised"
                    if detected else f"C{arm} sweep found nobody — reward 0, posterior lowered")
-        log(f"AUTO [{cycle}]: {outcome}; C{arm} now Beta({bandit.alpha[arm]:g}, {bandit.beta[arm]:g}); "
+        log(f"AUTO [{cycle}]: {outcome} (weight {bandit.last_confidence:.2f} from HMM position confidence); "
+            f"C{arm} now Beta({bandit.alpha[arm]:.2f}, {bandit.beta[arm]:.2f}); "
             f"battery {bot.battery:.1f} min")
         show('REWARD UPDATE', cycle, f"{outcome}. Battery {bot.battery:.1f} min.")
         db.log_mission(f"[AUTO] search chamber {arm}", mission_record(intent), route, (True, []), battery_before,

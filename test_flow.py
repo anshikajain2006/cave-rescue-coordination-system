@@ -72,4 +72,28 @@ assert q_route and q_route[0] == (0,0) and q_route[-1] == (17,2), q_route
 assert all(abs(a[0]-b[0]) + abs(a[1]-b[1]) == 1 for a, b in zip(q_route, q_route[1:])), "route not contiguous"
 print(f"PASS Autonomous mission: bandit reward update OK, Q-learning route to (17,2) in {len(q_route)-1} moves")
 
+# Test 9: HMM-coupled bandit — uncertainty favours nearby chambers and weakens reward updates
+from autonomous_mission import HMMCoupling
+from llm_parser import CHAMBER_MAP
+coupled_loc = CaveHMMLocaliser(cave)
+coupling = HMMCoupling(lambda: coupled_loc, nav, CHAMBER_MAP)
+n_states = len(coupled_loc.belief)
+state_cell = {s: (c - 1, r - 1) for s in range(n_states) for r, c in [coupled_loc.hmm_env.state_to_coord(s)]}
+entrance = next(s for s, cell in state_cell.items() if cell == (0, 0))
+spread = np.zeros(n_states)
+spread[[s for s, cell in state_cell.items() if cell in cave.cave_map]] = 1.0
+spread[entrance] = 246.0  # Half the belief at the entrance, half spread over the other open cells
+coupled_loc.estimator.belief_state = spread / spread.sum()
+weights = coupling.reach_weights([1, 3])
+assert weights[1] > weights[3], weights  # C1 (9 moves from the entrance) beats C3 (21 moves) when unsure
+coupled_bandit = ThompsonBandit(range(1, 10), np.random.default_rng(0), hmm=coupling)
+coupled_bandit.update(3, 0)
+assert 0 < coupled_bandit.last_confidence < 1 and coupled_bandit.beta[3] < 2, coupled_bandit.table()
+certain = np.zeros(n_states)
+certain[entrance] = 1.0
+coupled_loc.estimator.belief_state = certain
+assert coupling.position_confidence() == 1.0 and set(coupling.reach_weights([1, 3]).values()) == {1.0}
+print(f"PASS HMM-coupled bandit: reach weight C1 {weights[1]:.2f} > C3 {weights[3]:.2f}, "
+      f"uncertain update weight {coupled_bandit.last_confidence:.2f}")
+
 print("\nAll systems checked. Ready for demo.")
