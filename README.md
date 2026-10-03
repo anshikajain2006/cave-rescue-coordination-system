@@ -12,7 +12,7 @@ Every mission is logged to SQLite and shown on a Streamlit dashboard.
 
 ![Demo: autonomous mission, conflict rerouting and the MDP pilot](demo.gif)
 
-*Demo at 6× speed. Full-length recording (4 min): [demo.mp4](demo.mp4)*
+*Demo at 4× speed. Full-length recording (4 min): [demo.mp4](demo.mp4)*
 
 ---
 
