@@ -1,12 +1,12 @@
 import base64
 import html
 import io
-import json
 import logging
 import re
 import time
 from contextlib import contextmanager
 from datetime import datetime
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -17,18 +17,24 @@ from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.patches import Rectangle
 
 import llm_parser
+import react_parser
 from cave_db import MissionDatabase
-from cave_environment import CaveEnvironment, RescueBot, create_fleet
+from cave_environment import CaveEnvironment, RescueBot, create_fleet, get_wall_observation
 from cave_mdp import CaveMDPPilot
 from llm_parser import CHAMBER_MAP, CHAMBER_NAMES
+from models import CaveCommand
+from react_parser import AwaitingClarification, keyword_parse, react_parse, resume_react
 from planner import ForkliftPlanner
 from safety_verifier import EMPTY_BOT_DIAMETER_M, LOADED_BOT_DIAMETER_M, SafetyVerifier
+from smt_verifier import verify_command_smt
 from conflict_resolution import resolve_conflicts
 
 st.set_page_config(layout="wide", page_icon="🔦", page_title="CAVE RESCUE OPS")
+st.markdown('<style>section.main > div {max-width: 100%; padding-left: 1rem; padding-right: 1rem;} .block-container {padding-top: 1rem; padding-bottom: 1rem;}</style>', unsafe_allow_html=True)
 
 try:
     from cave_hmm import HMM_BORDER, CaveHMMLocaliser
+    from confidence_gate import confidence_status, is_confident
 except SyntaxError as exc:  # hmm_environment.py currently has mixed tab/space indentation
     st.error(f"Could not load the HMM module: {type(exc).__name__} in {exc.filename}, line {exc.lineno}. "
              "Fix the indentation in _build_transition_matrix in hmm_environment.py and reload.")
@@ -36,7 +42,7 @@ except SyntaxError as exc:  # hmm_environment.py currently has mixed tab/space i
 
 START_POSITION = CHAMBER_MAP[0]     # Bot is deployed at the cave entrance
 INITIAL_BATTERY_MIN = 30.0
-HMM_SENSED_STEPS = 3                # Final moves of each mission that get a full sonar filter step
+SCAN_SONAR_READINGS = 3             # Stationary sonar readings taken by a SCAN command
 DEFAULT_PAYLOAD_KG = 1.0            # Assumed weight for items not listed below
 PAYLOAD_WEIGHTS_KG = {
     'oxygen_kit': 3.0,
@@ -220,6 +226,9 @@ html, body, .stApp, [data-testid="stAppViewContainer"] {{ background: var(--pape
 /* Figure plates */
 .plate {{ padding: 10px 12px 8px; margin-top: 0.3rem; }}
 .plate img {{ width: 100%; height: auto; display: block; }}
+/* Compact plate: capped at 420 px tall and never wider than its card, keeping the figure's aspect ratio */
+.plate.plate-compact {{ max-width: 100%; min-width: 0; box-sizing: border-box; }}
+.plate.plate-compact img {{ width: auto; height: auto; max-width: 100%; max-height: 420px; margin: 0 auto; }}
 .plate-legend {{ display: flex; flex-wrap: wrap; gap: 0.3rem 1.5rem; font-size: 12px; color: var(--text2); padding: 2px 2px 8px;
   border-bottom: 1px solid #eee8da; margin-bottom: 8px; }}
 .plate-legend .ref {{ font-family: var(--serif) !important; font-style: italic; color: var(--text); margin-right: auto; }}
@@ -294,7 +303,6 @@ def init_session():
     ss.last_bot = HMM_BOT
     ss.last_result = None
     ss.mission_log = []
-    ss.rng = np.random.default_rng()
     for bot in ss.bots.values():
         log(f"System online. {bot.bot_id} deployed at {bot.position}, battery {bot.battery:.1f} min.")
 
@@ -303,26 +311,34 @@ def log(message: str):
     st.session_state.mission_log.append(f"[{datetime.now():%H:%M:%S}] {message}")
 
 
-def map_estimate():
-    """(x, y, probability) of the highest-belief cell"""
+def synced_localiser() -> CaveHMMLocaliser:
+    """The session localiser with its estimator loaded from the stored belief"""
     loc = st.session_state.localiser
     loc.estimator.belief_state = st.session_state.belief
-    x, y = loc.most_likely_position()
+    return loc
+
+
+def map_estimate():
+    """(x, y, probability) of the highest-belief cell"""
+    x, y = synced_localiser().most_likely_position()
     return x, y, float(st.session_state.belief.max())
 
 
 @contextmanager
 def capture_parser_warnings():
-    """Routes llm_parser's fallback warnings into the mission log"""
+    """Routes the parsers' fallback warnings into the mission log"""
     class Handler(logging.Handler):
         def emit(self, record):
             log(f"LLM PARSER: {record.getMessage()}")
     handler = Handler(level=logging.WARNING)
-    llm_parser.logger.addHandler(handler)
+    loggers = (llm_parser.logger, react_parser.logger)
+    for logger in loggers:
+        logger.addHandler(handler)
     try:
         yield
     finally:
-        llm_parser.logger.removeHandler(handler)
+        for logger in loggers:
+            logger.removeHandler(handler)
 
 
 # =====================================================================
@@ -330,16 +346,82 @@ def capture_parser_warnings():
 # =====================================================================
 def run_command(text: str, api_key: str, bot_id: str = HMM_BOT):
     ss = st.session_state
-    bot = ss.bots[bot_id]
-    other = next(b for b in ss.bots.values() if b.bot_id != bot_id)
+    ss.pop('pending_clarification', None)  # A new command abandons any unanswered question
     ss.last_bot = bot_id
     log(f"COMMAND [{bot_id}]: {text!r}")
 
-    with capture_parser_warnings():
-        intent = llm_parser.parse_command(text, api_key)
-    log(f"PARSED INTENT: {json.dumps(intent)}")
+    if ss.get('use_react', True):
+        intent = parse_intent(lambda: react_parse(text, api_key, clarify_callback=defer_clarification), bot_id)
+    else:
+        intent = parse_intent(lambda: keyword_only(text), bot_id)
+    if intent:
+        execute_intent(text, intent, bot_id)
 
-    if intent['action'] == 'status':
+
+def keyword_only(text: str):
+    """The keyword parser alone, with a one-step trace, for when the ReACT parser is switched off"""
+    intent = keyword_parse(text)
+    return intent, [{"step": 1, "type": "KEYWORD", "reason": "ReACT parser off — keyword parser used",
+                     "result": intent.action}]
+
+
+def answer_clarification(answer: str, api_key: str):
+    """Resumes the paused ReACT loop with the user's answer, then runs the command if it now parses"""
+    ss = st.session_state
+    state = ss.pop('pending_clarification')
+    bot_id = state.extra['bot_id']
+    ss.last_bot = bot_id
+    log(f"ANSWER [{bot_id}]: {answer!r}")
+    intent = parse_intent(lambda: resume_react(state, answer, api_key, clarify_callback=defer_clarification), bot_id)
+    if intent:
+        execute_intent(state.user_text, intent, bot_id)
+
+
+def defer_clarification(question: str) -> str:
+    """ReACT clarify_callback for Streamlit: the answer comes on a later rerun, so pause the loop"""
+    raise AwaitingClarification(question)
+
+
+def parse_intent(parse, bot_id: str) -> Optional[CaveCommand]:
+    """Runs a parse step; returns the command, or None after posting a clarifying question or rejection"""
+    ss = st.session_state
+    try:
+        with capture_parser_warnings():
+            intent, trace = parse()
+    except AwaitingClarification as pause:
+        state = pause.state
+        state.extra['bot_id'] = bot_id
+        ss.pending_clarification = state
+        ss.parse_trace = state.trace
+        log(f"REACT CLARIFY [{bot_id}]: {state.question}")
+        ss.last_result = ('clarify', state.question)
+        return None
+    except ValueError as exc:
+        ss.parse_trace = []
+        log(f"REJECTED: {exc}")
+        ss.last_result = ('error', str(exc))
+        return None
+    ss.parse_trace = trace
+    for step in trace:
+        log(f"REACT STEP {step['step']} {step['type']}: "
+            + ', '.join(f"{k}={v}" for k, v in step.items() if k not in ('step', 'type')))
+    log(f"PARSED INTENT: {intent.model_dump_json()}")
+    return intent
+
+
+def execute_intent(text: str, intent: CaveCommand, bot_id: str):
+    """Gates, plans, verifies and executes a parsed command for bot_id"""
+    ss = st.session_state
+    bot = ss.bots[bot_id]
+    other = next(b for b in ss.bots.values() if b.bot_id != bot_id)
+
+    if intent.action == 'hold':
+        msg = f"{bot_id} holding position at {bot.position}, battery {bot.battery:.1f} min."
+        log(f"HOLD: {msg}")
+        ss.last_result = ('info', msg)
+        return
+
+    if intent.action == 'status':
         if bot_id == HMM_BOT:
             x, y, p = map_estimate()
             msg = (f"{bot_id} at {bot.position}, MAP estimate ({x}, {y}) with p={p:.2f}, "
@@ -350,15 +432,27 @@ def run_command(text: str, api_key: str, bot_id: str = HMM_BOT):
         ss.last_result = ('info', msg)
         return
 
-    chamber = intent['target_chamber']
-    if chamber is None and intent['action'] == 'navigate':
+    chamber = intent.target_chamber
+    if chamber is None and intent.action in ('move', 'deliver', 'replan'):
         msg = f"No valid target chamber (0-9) in the command; {bot_id} holds position."
         log(f"REJECTED: {msg}")
         ss.last_result = ('error', msg)
         return
     target = CHAMBER_MAP[chamber] if chamber is not None else bot.position  # Scan without target: scan here
 
-    payload = intent['payload']
+    # Confidence gate: UNIT-01 only navigates when its HMM belief is concentrated enough
+    if bot_id == HMM_BOT and intent.action in ('move', 'deliver', 'replan') and not is_confident(synced_localiser()):
+        status = confidence_status(synced_localiser())
+        msg = f"⚠️ {status['message']}. Issue SCAN command to localise first."
+        log(f"BLOCKED_UNCERTAINTY [{bot_id}]: entropy {status['entropy']} >= threshold {status['threshold']}; "
+            f"{bot_id} holds position.")
+        ss.last_result = ('error', msg)
+        ss.mdp_advice = None
+        db.log_mission(text, mission_record(intent), [], (False, [f"BLOCKED_UNCERTAINTY: {status['message']}"]),
+                       bot.battery, bot.battery, bot.position, "HMM gate", bot_id=bot_id)
+        return
+
+    payload = intent.payload
     payload_kg = PAYLOAD_WEIGHTS_KG.get(payload, DEFAULT_PAYLOAD_KG) if payload else 0.0
 
     # Plan a candidate route, then verify it before anything moves
@@ -369,48 +463,65 @@ def run_command(text: str, api_key: str, bot_id: str = HMM_BOT):
 
     # Bid for any cells shared with the other bot's route in progress
     candidate = path
-    path, other_final = deconflict(bot, other, path, intent['priority'])
+    path, other_final = deconflict(bot, other, path, intent.priority)
     if candidate and not path:
         violations = [f"CONFLICT HOLD: {bot_id} lost the bid for cells on {other.bot_id}'s route and has no detour"]
         ss.last_result = ('violations', violations)
         ss.mdp_advice = None
         log(f"MISSION ABORTED: {bot_id} holds position.")
-        db.log_mission(text, intent, candidate, (False, violations), bot.battery, bot.battery, bot.position, "A*",
+        db.log_mission(text, mission_record(intent), candidate, (False, violations), bot.battery, bot.battery, bot.position, "A*",
                        bot_id=bot_id)
         return
 
-    verifier = SafetyVerifier(cave, battery_remaining_min=bot.battery)
-    is_safe, violations = verifier.check_mission(payload_kg, target, path)
-    log(f"SAFETY VERIFIER: {'PASS' if is_safe else 'FAIL'} [{bot_id}] "
-        f"(payload {payload or 'none'} = {payload_kg} kg, battery {bot.battery:.1f} min)"
+    use_smt = ss.get('use_smt', True)
+    if use_smt:
+        check = verify_command_smt(intent, path, cave, payload_kg, bot.battery)
+    else:  # Rule-based check_mission, wrapped in the same result dict
+        check = SafetyVerifier(cave, battery_remaining_min=bot.battery, use_smt=False).verify(intent, path, cave,
+                                                                                            payload_kg)
+    is_safe, violations = check['safe'], check['violations']
+    log(f"{'SMT VERIFIER' if use_smt else 'SAFETY VERIFIER'}: {'PASS' if is_safe else 'FAIL'} [{bot_id}] "
+        f"(payload {payload or 'none'} = {payload_kg} kg, battery {bot.battery:.1f} min) "
+        f"{check['proof']}, {check['checked_cells']} cells, {check['solver_result']}"
         + ("" if is_safe else f" -> {violations}"))
     if not is_safe:
         ss.last_result = ('violations', violations)
         log(f"MISSION ABORTED: {bot_id} holds position.")
         consult_mdp_pilot(target, payload_kg, bot)
-        db.log_mission(text, intent, path, (is_safe, violations), bot.battery, bot.battery, bot.position, "A*",
+        verdict = (False, ["SMT_VIOLATION"] + violations) if use_smt else (False, violations)
+        db.log_mission(text, mission_record(intent), path, verdict, bot.battery, bot.battery, bot.position, "A*",
                        bot_id=bot_id)
         return
+    if use_smt:
+        st.success(f"✓ SMT VERIFIED — {check['checked_cells']} cells checked")
     if other_final != other.active_route:
         yield_route(other, other_final)
     battery_before = bot.battery
 
     # Execute
     log(f"A* PATH [{bot_id}]: {' -> '.join(f'({x},{y})' for x, y in path)}")
+    scan_status = None
     if bot_id == HMM_BOT:
-        simulate_hmm(path)
+        if intent.action == 'scan':
+            scan_status = scan_localise(bot.position)
+        else:
+            simulate_hmm(path)
     moves = len(path) - 1
     bot.position = target
     bot.battery -= moves / 10
     bot.active_route = path
     bot.payload = payload
-    bot.priority = intent['priority']
+    bot.priority = intent.priority
 
-    msg = (f"{bot_id} {intent['action'].upper()} complete: at {target} after {moves} moves "
-           f"(priority {intent['priority']}).")
-    if intent['action'] == 'scan':
+    msg = (f"{bot_id} {intent.action.upper()} complete: at {target} after {moves} moves "
+           f"(priority {intent.priority}).")
+    if intent.action == 'scan':
         found = cave.cave_map[target].is_survivor_location
         msg += " SURVIVOR DETECTED." if found else " No survivor at this location."
+    if scan_status:
+        x, y, p = map_estimate()
+        msg += (f" Localisation: entropy {scan_status['entropy']:.3f} (threshold {scan_status['threshold']}), "
+                f"MAP ({x}, {y}) p={p:.2f} — {scan_status['message']}.")
     if payload:
         msg += f" Delivered {payload}."
     estimate = ''
@@ -419,8 +530,14 @@ def run_command(text: str, api_key: str, bot_id: str = HMM_BOT):
         estimate = f" MAP estimate ({x}, {y}) p={p:.2f};"
     log(f"{msg}{estimate} battery {bot.battery:.1f} min.")
     ss.last_result = ('success', msg)
-    db.log_mission(text, intent, path, (is_safe, violations), battery_before, bot.battery, bot.position, "A*",
+    db.log_mission(text, mission_record(intent), path, (is_safe, violations), battery_before, bot.battery, bot.position, "A*",
                    bot_id=bot_id)
+
+
+def mission_record(intent: CaveCommand) -> dict:
+    """The parsed-intent columns MissionDatabase.log_mission stores for a mission"""
+    return {'action': intent.action, 'target_chamber': intent.target_chamber, 'payload': intent.payload,
+            'priority': intent.priority}
 
 
 def deconflict(bot: RescueBot, other: RescueBot, path, priority: str):
@@ -472,33 +589,37 @@ def reset_belief(position):
 
 
 def simulate_hmm(path):
-    """Dead-reckons the belief along the route, then runs full filter steps on the final moves"""
+    """Runs a full predict/update filter step with the real sonar wall count at every cell along the route"""
     ss = st.session_state
     loc = ss.localiser
-    hmm_env = loc.hmm_env
     loc.estimator.belief_state = ss.belief
     moves = list(zip(path, path[1:]))
     if not moves:
         log("HMM: no movement, belief unchanged.")
         return
 
-    dead_reckoned, sensed = moves[:-HMM_SENSED_STEPS], moves[-HMM_SENSED_STEPS:]
-    for (x0, y0), (x1, y1) in dead_reckoned:
-        loc.estimator.belief_state = loc.estimator.predict(STEP_TO_ACTION[(x1 - x0, y1 - y0)])
-    if dead_reckoned:
-        x, y = loc.most_likely_position()
-        log(f"HMM: dead-reckoned {len(dead_reckoned)} moves (predict only) -> MAP ({x}, {y}) "
-            f"p={loc.estimator.belief_state.max():.3f}")
-
-    for i, ((x0, y0), (x1, y1)) in enumerate(sensed, 1):
+    for i, ((x0, y0), (x1, y1)) in enumerate(moves, 1):
         action = STEP_TO_ACTION[(x1 - x0, y1 - y0)]
-        true_state = hmm_env.coord_to_state(y1 + HMM_BORDER, x1 + HMM_BORDER)
-        observation = int(ss.rng.choice(5, p=hmm_env.E[:, true_state]))  # Noisy sonar at the true cell
+        observation = get_wall_observation(cave, (x1, y1))  # Real wall count at the bot's true cell
         belief = loc.step(action, observation)
         x, y = loc.most_likely_position()
-        log(f"HMM STEP {i}/{len(sensed)}: action={ACTION_NAMES[action]} sonar_walls={observation} "
+        log(f"HMM STEP {i}/{len(moves)}: action={ACTION_NAMES[action]} sonar_walls={observation} "
             f"-> MAP ({x}, {y}) p={belief.max():.3f}")
     ss.belief = loc.estimator.belief_state.copy()
+
+
+def scan_localise(position) -> dict:
+    """Stationary sonar sweep: SCAN_SONAR_READINGS measurement updates at position; returns confidence_status"""
+    ss = st.session_state
+    loc = synced_localiser()
+    observation = get_wall_observation(cave, position)
+    for i in range(1, SCAN_SONAR_READINGS + 1):
+        belief = loc.sense(observation)
+        x, y = loc.most_likely_position()
+        log(f"HMM SCAN {i}/{SCAN_SONAR_READINGS}: sonar_walls={observation} -> MAP ({x}, {y}) "
+            f"p={belief.max():.3f}, entropy {loc.belief_entropy():.3f}")
+    ss.belief = loc.estimator.belief_state.copy()
+    return confidence_status(loc)
 
 
 # =====================================================================
@@ -599,11 +720,13 @@ def run_mdp_replan(label: str, bot_id: str):
 # PLOTS
 # =====================================================================
 FIG_RC = {'font.family': 'sans-serif', 'font.serif': FIG_SERIF, 'font.sans-serif': FIG_SANS, 'svg.fonttype': 'path'}
+# The browser shows SVG at 96 px per inch: this keeps the survey map near its 420 px display cap, so its text stays legible
+SURVEY_MAP_FIGSIZE = (6.8, 4.4)
 PAPER_BOX = {'facecolor': PAPER, 'edgecolor': BORDER, 'linewidth': 0.6, 'boxstyle': 'square,pad=0.3', 'alpha': 0.92}
 
 
-def survey_axes(title):
-    fig, ax = plt.subplots(figsize=(16, 10), facecolor=PAPER)
+def survey_axes(title, figsize=(16, 10)):
+    fig, ax = plt.subplots(figsize=figsize, facecolor=PAPER)
     ax.set_facecolor(DRY_CELL)
     ax.set_title(title, color=TEXT, fontsize=11, loc='left', family='serif', fontweight='bold', pad=10)
     ax.set_xticks(range(cave.width))
@@ -655,7 +778,7 @@ def draw_cave_map():
     for (x, y), cell in cave.cave_map.items():
         water[y, x] = cell.water_level
 
-    fig, ax = survey_axes("Hydrological Survey — Water Intrusion Overlay")
+    fig, ax = survey_axes("Hydrological Survey — Water Intrusion Overlay", figsize=SURVEY_MAP_FIGSIZE)
     im = ax.imshow(np.ma.masked_invalid(water), cmap=WATER_CMAP, vmin=0, vmax=1, origin='upper',
                    interpolation='nearest', zorder=0)
     draw_rock(ax)
@@ -766,7 +889,7 @@ def figure_img(draw_fn, alt: str) -> str:
     return f'<img src="data:image/svg+xml;base64,{encoded}" alt="{html.escape(alt)}">'
 
 
-def plate(draw_fn, legend_html: str, alt: str, cache_key=None):
+def plate(draw_fn, legend_html: str, alt: str, cache_key=None, css_class: str = ''):
     """Renders a figure card; with cache_key, reuses the last SVG while the key is unchanged (~1 s per render)"""
     cache = st.session_state.setdefault('plate_cache', {})
     cached = cache.get(draw_fn.__name__)
@@ -775,7 +898,7 @@ def plate(draw_fn, legend_html: str, alt: str, cache_key=None):
     else:
         img = figure_img(draw_fn, alt)
         cache[draw_fn.__name__] = (cache_key, img)
-    st.html(f'<div class="card plate"><div class="plate-legend">{legend_html}</div>{img}</div>')
+    st.html(f'<div class="card plate {css_class}"><div class="plate-legend">{legend_html}</div>{img}</div>')
 
 
 # =====================================================================
@@ -893,7 +1016,8 @@ def result_html() -> str:
             ('Battery remaining', f'{bot.battery:.1f} min')))
         return (f'<div class="alert alert-success"><div class="title">Route Confirmed — Mission Authorized</div>'
                 f'<div class="metrics">{metrics}</div><div class="body">{html.escape(content)}</div></div>')
-    css_class, title = {'error': ('alert-error', 'Command Rejected'), 'info': ('alert-info', 'Status Report')}[kind]
+    css_class, title = {'error': ('alert-error', 'Command Rejected'), 'info': ('alert-info', 'Status Report'),
+                        'clarify': ('alert-info', 'Clarification Needed')}[kind]
     return (f'<div class="alert {css_class}"><div class="title">{title}</div>'
             f'<div class="body">{html.escape(content)}</div></div>')
 
@@ -982,6 +1106,11 @@ with st.sidebar:
                             help="Rescue commands and the MDP Pilot tab apply to this unit.")
     api_key = st.text_input("OpenAI API key", type="password",
                             help="Used only for this session. Without it, commands use the keyword parser.")
+    st.checkbox("Use SMT Verifier", value=True, key='use_smt',
+                help="Prove each route with the Z3 SMT solver. Unchecked: the rule-based SafetyVerifier.")
+    st.toggle("Use ReACT Parser", value=True, key='use_react',
+              help="Parse with an LLM Reason-Act-Observe loop that can ask a clarifying question. "
+                   "Off: keyword parser only.")
     with st.form("command_form", clear_on_submit=True):
         command = st.text_input("Rescue command", placeholder="e.g. Oxygen kit to chamber 3")
         submitted = st.form_submit_button("Submit command", use_container_width=True)
@@ -989,6 +1118,17 @@ with st.sidebar:
     if submitted and command.strip():
         with st.spinner("Parsing, verifying and planning..."):
             run_command(command.strip(), api_key, selected_bot)
+
+    if ss.get('pending_clarification'):
+        with st.form("clarify_form", clear_on_submit=True):
+            st.info(f"🤔 {ss.pending_clarification.question}")
+            answer = st.text_input("Your answer", key='clarify_answer')
+            answered = st.form_submit_button("Send answer", use_container_width=True)
+        if answered and answer.strip():
+            with st.spinner("Resuming parse..."):
+                answer_clarification(answer.strip(), api_key)
+            if ss.get('pending_clarification'):  # A follow-up question: redraw the form with it
+                st.rerun()
 
     if st.button("Reset mission", use_container_width=True):
         for key in list(ss.keys()):
@@ -1002,12 +1142,32 @@ with st.sidebar:
 st.html(header_html())
 if ss.last_result:
     st.html(result_html())
+if ss.get('parse_trace'):
+    with st.expander("🔍 Parse trace"):
+        for step in ss.parse_trace:
+            st.markdown(f"**Step {step['step']} — {step['type']}**")
+            details = '\n'.join(f"{key}: {value}" for key, value in step.items() if key not in ('step', 'type'))
+            if details:
+                st.code(details, language=None, wrap_lines=True)
 
 tab_map, tab_loc, tab_log, tab_mdp = st.tabs(["Cave Map", "Bot Localisation", "Mission Log", "MDP Pilot"])
 with tab_map:
     plate(draw_cave_map, MAP_LEGEND, "Survey map with water depth, rock, survivors, A* route and estimated unit position",
+          css_class='plate-compact',
           cache_key=tuple((tuple(b.active_route), b.position) for b in ss.bots.values()) + (map_estimate()[:2],))
 with tab_loc:
+    st.html('<div class="section-head">Localisation — UNIT-01</div>')
+    gate = confidence_status(synced_localiser())
+    map_x, map_y, map_p = map_estimate()
+    col_entropy, col_threshold, col_map, col_badge = st.columns(4, vertical_alignment='center')
+    col_entropy.metric("Belief entropy", f"{gate['entropy']:.3f}", help="Shannon entropy of the HMM belief (nats)")
+    col_threshold.metric("Threshold", f"{gate['threshold']}")
+    col_map.metric("MAP estimate", f"({map_x}, {map_y})", f"p = {map_p:.2f}", delta_color='off')
+    with col_badge:
+        if gate['confident']:
+            st.success("CONFIDENT")
+        else:
+            st.error("UNCERTAIN")
     plate(draw_belief_map, BELIEF_LEGEND, "Posterior belief map of the unit's position",
           cache_key=hash(ss.belief.tobytes()))
 with tab_mdp:

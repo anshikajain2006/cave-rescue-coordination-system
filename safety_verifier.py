@@ -1,6 +1,7 @@
 from typing import List, Sequence, Tuple
 
 from cave_environment import CaveEnvironment
+from models import CaveCommand
 
 EMPTY_BOT_DIAMETER_M = 0.25
 LOADED_BOT_DIAMETER_M = 0.6    # Diameter when carrying any payload
@@ -10,11 +11,37 @@ DEFAULT_BATTERY_MIN = 30.0
 
 
 class SafetyVerifier:
-    """Deterministic pre-mission safety checks against the cave map. Pure math, no LLM."""
+    """Deterministic pre-mission safety checks against the cave map. Pure math, no LLM.
 
-    def __init__(self, cave_env: CaveEnvironment, battery_remaining_min: float = DEFAULT_BATTERY_MIN):
+    verify() proves the route with the Z3 SMT verifier when use_smt is True, else runs the rule-based
+    check_mission(); both return the same result dict.
+    """
+
+    def __init__(self, cave_env: CaveEnvironment, battery_remaining_min: float = DEFAULT_BATTERY_MIN,
+                 use_smt: bool = True):
         self.cave_env = cave_env
         self.battery_remaining_min = battery_remaining_min  # Update between missions as the battery drains
+        self.use_smt = use_smt
+
+    def verify(self, command: CaveCommand, path, env: CaveEnvironment, payload_kg: float = 0.0) -> dict:
+        """Returns {"safe", "proof", "violations", "checked_cells", "solver_result"}"""
+        if self.use_smt:
+            from smt_verifier import verify_command_smt  # Deferred: smt_verifier imports this module's constants
+            return verify_command_smt(command, path, env, payload_kg, self.battery_remaining_min)
+
+        cells = [(cell[0], cell[1]) for cell in path]
+        if not cells:
+            is_safe, violations = False, ["NO PATH FOUND"]
+        else:
+            rules = SafetyVerifier(env, self.battery_remaining_min)
+            is_safe, violations = rules.check_mission(payload_kg, cells[-1], cells)
+        return {
+            "safe": is_safe,
+            "proof": "VERIFIED" if is_safe else "VIOLATED",
+            "violations": violations,
+            "checked_cells": len(cells),
+            "solver_result": "rules",
+        }
 
     def check_mission(self, bot_payload_kg: float, target_cell: Tuple[int, int],
                       path: Sequence[Tuple[int, int]]) -> Tuple[bool, List[str]]:

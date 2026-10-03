@@ -139,3 +139,16 @@ class RescueBot:
 
 def create_fleet(battery: float = DEFAULT_BATTERY_MIN) -> Dict[str, RescueBot]:
     return {bot_id: RescueBot(bot_id, position, battery) for bot_id, position in FLEET_START_POSITIONS.items()}
+
+
+def get_wall_observation(env: CaveEnvironment, position: Tuple[int, int]) -> int:
+    """Count adjacent walls (N, S, E, W) at position (x, y). Returns 0-4; off-grid counts as wall."""
+    x, y = position
+    count = 0
+    for dx, dy in ((0, -1), (0, 1), (1, 0), (-1, 0)):
+        nx, ny = x + dx, y + dy
+        if not (0 <= nx < env.width and 0 <= ny < env.height):
+            count += 1  # Out of bounds counts as wall
+        elif env.grid[ny][nx] == 1:  # Rock cell
+            count += 1
+    return count

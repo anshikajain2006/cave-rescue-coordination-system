@@ -43,6 +43,20 @@ else:
 # Test 5: LLM parser fallback (offline)
 from llm_parser import parse_command
 result = parse_command("send bot to chamber 3", api_key=None)
-print(f"PASS LLM fallback: action={result.get('action')}, target={result.get('target_chamber')}")
+print(f"PASS LLM fallback: action={result.action}, target={result.target_chamber}")
+
+# Test 6: Z3 SMT verifier proves the A* route to (17,2)
+from smt_verifier import verify_path_smt
+path_17_2, _, _ = planner.a_star((0,0), (17,2), "manhattan")
+smt_result = verify_path_smt(path_17_2, cave)
+assert smt_result["proof"] == "VERIFIED", smt_result
+print(f"PASS SMT verifier: {smt_result['checked_cells']} cells VERIFIED")
+
+# Test 7: ReACT parser falls back to the keyword parser without an API key
+from react_parser import react_parse
+react_cmd, trace = react_parse("rush oxygen kit to chamber 5", api_key=None)
+assert react_cmd.action == "deliver" and react_cmd.target_chamber == 5, react_cmd
+assert trace[0]["type"] == "FALLBACK", trace
+print(f"PASS ReACT parser (no-key fallback): action={react_cmd.action}, target={react_cmd.target_chamber}")
 
 print("\nAll systems checked. Ready for demo.")

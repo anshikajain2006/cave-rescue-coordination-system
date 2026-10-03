@@ -3,7 +3,7 @@ from typing import Tuple
 
 import numpy as np
 
-from cave_environment import CaveEnvironment
+from cave_environment import CaveEnvironment, get_wall_observation
 from hmm_environment import WarehouseHMMEnvironment
 from hmm_filter import HMMStateEstimator
 
@@ -40,9 +40,25 @@ class CaveHMMLocaliser:
         self.hmm_env = WarehouseHMMEnvironment(grid_to_hmm_string(cave_env), sensor_accuracy=sensor_accuracy)
         self.estimator = HMMStateEstimator(self.hmm_env.num_states, self.hmm_env.T, self.hmm_env.E)
 
+    @property
+    def belief(self) -> np.ndarray:
+        """Current belief over HMM states (1D, sums to 1)"""
+        return self.estimator.belief_state
+
     def step(self, action: int, observation: int) -> np.ndarray:
         """Runs one predict/update cycle and returns the full belief array over HMM states"""
         return self.estimator.bayesian_filter_step(action, observation)
+
+    def sense(self, observation: int) -> np.ndarray:
+        """Measurement update only, for a sonar reading taken without moving; returns the new belief"""
+        self.estimator.belief_state = self.estimator.update(observation, self.estimator.belief_state)
+        return self.estimator.belief_state
+
+    def belief_entropy(self) -> float:
+        """Shannon entropy of current belief distribution (nats). Higher = more uncertain."""
+        b = self.belief
+        b = b[b > 0]  # Avoid log(0)
+        return float(-np.sum(b * np.log(b))) + 0.0  # + 0.0 turns -0.0 (a certain belief) into 0.0
 
     def most_likely_position(self) -> Tuple[int, int]:
         """Cave (x, y) of the highest-belief state"""
@@ -52,13 +68,20 @@ class CaveHMMLocaliser:
 
 if __name__ == '__main__':
     rng = random.Random(0)
-    localiser = CaveHMMLocaliser(CaveEnvironment())
+    env = CaveEnvironment()
+    localiser = CaveHMMLocaliser(env)
     action_names = ['N', 'S', 'E', 'W']
+    action_steps = [(0, -1), (0, 1), (1, 0), (-1, 0)]
+    true_pos = (0, 0)
 
-    print(grid_to_hmm_string(localiser.cave_env, pad_border=False))
+    print(grid_to_hmm_string(env, pad_border=False))
     for t in range(1, 6):
-        action, observation = rng.randrange(4), rng.randrange(5)
+        action = rng.randrange(4)
+        dx, dy = action_steps[action]
+        if env.is_valid(true_pos[0] + dx, true_pos[1] + dy):  # Bumping into rock leaves the bot in place
+            true_pos = (true_pos[0] + dx, true_pos[1] + dy)
+        observation = get_wall_observation(env, true_pos)
         belief = localiser.step(action, observation)
         x, y = localiser.most_likely_position()
-        print(f"step {t}: action={action_names[action]} walls_sensed={observation} "
-              f"-> most likely ({x}, {y}) p={belief.max():.3f} sum={belief.sum():.3f}")
+        print(f"step {t}: action={action_names[action]} true={true_pos} walls_sensed={observation} "
+              f"-> most likely ({x}, {y}) p={belief.max():.3f} entropy={localiser.belief_entropy():.3f}")

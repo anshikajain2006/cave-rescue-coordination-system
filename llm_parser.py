@@ -1,7 +1,11 @@
 import json
 import logging
 import re
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, get_args
+
+from pydantic import ValidationError
+
+from models import CaveCommand
 
 if TYPE_CHECKING:
     from openai.types.shared_params import ResponseFormatJSONSchema
@@ -51,8 +55,8 @@ CHAMBER_ALIASES: Dict[int, List[str]] = {
     9: ['east chamber', 'east'],
 }
 
-ACTIONS = ('navigate', 'scan', 'status')
-PRIORITIES = ('low', 'medium', 'high')
+ACTIONS: Tuple[str, ...] = get_args(CaveCommand.model_fields['action'].annotation)
+PRIORITIES: Tuple[str, ...] = get_args(CaveCommand.model_fields['priority'].annotation)
 
 CHAMBER_LINES = '\n'.join(
     f"- C{n}: {CHAMBER_NAMES[n]} ({x},{y}) — also called " + ', '.join(f'"{a}"' for a in CHAMBER_ALIASES[n])
@@ -64,20 +68,22 @@ The cave has these chambers (use the NUMBER as target_chamber):
 {CHAMBER_LINES}
 Chambers 2, 3 and 4 hold known survivors.
 
-Return ONLY valid JSON with these fields:
-- action: one of "navigate" (move to a chamber, including rescue and delivery runs), "scan" (search or sonar sweep for survivors), "status" (report position, battery or mission state)
-- target_chamber: integer 0-9, or null if no chamber is given or it is outside 0-9
+Return ONLY a JSON object matching the CaveCommand schema exactly, with these fields and no others:
+- action: one of "move" (go to a chamber with nothing to drop off), "deliver" (take a payload to a chamber), "scan" (search or sonar sweep for survivors at the bot's current position), "status" (report position, battery or mission state), "replan" (compute a new route, e.g. after flooding or a blocked passage), "hold" (stop, wait or stay in place)
+- target_chamber: integer 0-9, or null if no chamber is given, it is outside 0-9, or action is "scan" or "status"
 - payload: short snake_case item to deliver, e.g. "oxygen_kit", "medical_kit", "water", "food", "thermal_blanket", "rope", "radio"; or null if none
-- priority: one of "high" (urgent, emergency or life-threatening wording), "medium" (default), "low" (explicitly non-urgent)
+- priority: one of "high" (urgent, emergency or life-threatening wording), "normal" (default), "low" (explicitly non-urgent)
+- bot_id: the rescue unit named in the command, formatted like "UNIT-01"; or null if none is named
 
-Only use information in the command; never invent a chamber or payload.
+Only use information in the command; never invent a chamber, payload or bot.
 
-Example: "Rush an oxygen kit to the lower sump" -> {{"action": "navigate", "target_chamber": 2, "payload": "oxygen_kit", "priority": "high"}}"""
+Example: "Rush an oxygen kit to the lower sump" -> {{"action": "deliver", "target_chamber": 2, "payload": "oxygen_kit", "priority": "high", "bot_id": null}}"""
 
+# Strict structured output for the LLM-filled CaveCommand fields; raw_text is set from the user input, not the model
 RESPONSE_SCHEMA: 'ResponseFormatJSONSchema' = {
     'type': 'json_schema',
     'json_schema': {
-        'name': 'rescue_command',
+        'name': 'cave_command',
         'strict': True,
         'schema': {
             'type': 'object',
@@ -86,16 +92,22 @@ RESPONSE_SCHEMA: 'ResponseFormatJSONSchema' = {
                 'target_chamber': {'type': ['integer', 'null']},
                 'payload': {'type': ['string', 'null']},
                 'priority': {'type': 'string', 'enum': list(PRIORITIES)},
+                'bot_id': {'type': ['string', 'null']},
             },
-            'required': ['action', 'target_chamber', 'payload', 'priority'],
+            'required': ['action', 'target_chamber', 'payload', 'priority', 'bot_id'],
             'additionalProperties': False,
         },
     },
 }
 
 
-def parse_command(user_text: str, api_key: str) -> dict:
-    """Parses a rescue command with gpt-4o-mini, falling back to keyword rules if the call fails"""
+def parse_command(user_text: str, api_key: Optional[str]) -> CaveCommand:
+    """Parses a rescue command with gpt-4o-mini, falling back to keyword rules if the call or validation fails.
+
+    Raises ValueError with a readable message if the command cannot be parsed at all.
+    """
+    if not user_text or not user_text.strip():
+        raise ValueError("Empty command: type an instruction such as 'oxygen kit to chamber 3'.")
     try:
         return _parse_with_llm(user_text, api_key)
     except Exception as exc:
@@ -103,7 +115,9 @@ def parse_command(user_text: str, api_key: str) -> dict:
         return _parse_with_keywords(user_text)
 
 
-def _parse_with_llm(user_text: str, api_key: str) -> dict:
+def _parse_with_llm(user_text: str, api_key: Optional[str]) -> CaveCommand:
+    if not api_key:
+        raise ValueError("no API key provided")
     from openai import OpenAI  # Imported here so the fallback still works if openai is not installed
 
     client = OpenAI(api_key=api_key, timeout=API_TIMEOUT_SECONDS)
@@ -119,27 +133,13 @@ def _parse_with_llm(user_text: str, api_key: str) -> dict:
     content = response.choices[0].message.content
     if content is None:  # Refusal or empty completion
         raise ValueError("model returned no content")
-    return _validate(json.loads(content))
-
-
-def _validate(result: dict) -> dict:
-    """Enforces the output contract; raises ValueError so bad model output triggers the fallback"""
-    action, priority = result.get('action'), result.get('priority')
-    chamber, payload = result.get('target_chamber'), result.get('payload')
-    if action not in ACTIONS:
-        raise ValueError(f"invalid action {action!r}")
-    if priority not in PRIORITIES:
-        raise ValueError(f"invalid priority {priority!r}")
-    if chamber is not None and (isinstance(chamber, bool) or not isinstance(chamber, int)):
-        raise ValueError(f"invalid target_chamber {chamber!r}")
-    if payload is not None and not isinstance(payload, str):
-        raise ValueError(f"invalid payload {payload!r}")
-    return {
-        'action': action,
-        'target_chamber': chamber if chamber in CHAMBER_MAP else None,
-        'payload': (payload.strip() or None) if payload else None,
-        'priority': priority,
-    }
+    data = json.loads(content)
+    if not isinstance(data, dict):
+        raise ValueError(f"model returned {type(data).__name__}, expected a JSON object")
+    if isinstance(data.get('payload'), str):
+        data['payload'] = data['payload'].strip() or None
+    # ValidationError (a ValueError) on any bad field sends parse_command to the keyword fallback
+    return CaveCommand(**{**data, 'raw_text': user_text})
 
 
 # =====================================================================
@@ -174,13 +174,16 @@ PAYLOAD_KEYWORDS = [
     ('rope', 'rope'),
     ('radio', 'radio'),
 ]
+HOLD_WORDS = ('hold', 'stop', 'wait', 'stay', 'halt', 'freeze', 'abort')
+REPLAN_WORDS = ('replan', 're-plan', 'reroute', 're-route', 'new route', 'recalculate')
+BOT_PATTERN = re.compile(r'\bunit[\s-]*0*(\d+)\b')  # "unit 2" / "UNIT-02" (text is lowercased)
 SCAN_WORDS = ('scan', 'search', 'sonar', 'sweep', 'look for', 'check for', 'locate')
 STATUS_WORDS = ('status', 'report', 'battery', 'where are you', 'position', 'progress')
 HIGH_PRIORITY_WORDS = ('urgent', 'emergency', 'immediately', 'critical', 'asap', 'now', 'hurry', 'dying')
 LOW_PRIORITY_WORDS = ('low priority', 'no rush', 'when possible', 'whenever', 'not urgent')
 
 
-def _parse_with_keywords(user_text: str) -> dict:
+def _parse_with_keywords(user_text: str) -> CaveCommand:
     text = user_text.lower()
 
     chamber: Optional[int] = next(
@@ -193,18 +196,30 @@ def _parse_with_keywords(user_text: str) -> dict:
 
     payload = next((name for word, name in PAYLOAD_KEYWORDS if word in text), None)
 
+    bot_match = BOT_PATTERN.search(text)
+    bot_id = f"UNIT-{int(bot_match.group(1)):02d}" if bot_match else None
+
     if any(word in text for word in SCAN_WORDS):
         action = 'scan'
+    elif any(re.search(rf'\b{re.escape(word)}\b', text) for word in REPLAN_WORDS):
+        action = 'replan'
+    elif any(re.search(rf'\b{re.escape(word)}\b', text) for word in HOLD_WORDS) and chamber is None:
+        action = 'hold'
     elif any(word in text for word in STATUS_WORDS) and chamber is None and payload is None:
         action = 'status'
     else:
-        action = 'navigate'
+        action = 'deliver' if payload else 'move'
 
     if any(word in text for word in LOW_PRIORITY_WORDS):
         priority = 'low'
     elif any(re.search(rf'\b{re.escape(word)}\b', text) for word in HIGH_PRIORITY_WORDS):
         priority = 'high'
     else:
-        priority = 'medium'
+        priority = 'normal'
 
-    return {'action': action, 'target_chamber': chamber, 'payload': payload, 'priority': priority}
+    try:
+        return CaveCommand(action=action, target_chamber=chamber, payload=payload, priority=priority,
+                           bot_id=bot_id, raw_text=user_text)
+    except ValidationError as exc:
+        problems = '; '.join(error['msg'] for error in exc.errors())
+        raise ValueError(f"Could not understand the command {user_text!r}: {problems}") from exc
