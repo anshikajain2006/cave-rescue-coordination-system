@@ -88,7 +88,7 @@ MINUTES_PER_MOVE = 0.1          # Same drain rate run_command applies to the bat
 AUTO_ARMS = range(1, 10)        # Chambers the autonomous search can choose (C0 is the entrance)
 AUTO_MAX_CYCLES = 20            # Hard stop, so a run of unlucky sonar misses cannot loop for ever
 AUTO_STEP_DELAY_S = 0.8         # Pause after each phase so the run can be followed on screen
-AUTO_EXHAUSTED_MEAN = 0.05      # Stop once every chamber still in play has a posterior mean below this
+AUTO_EXHAUSTED_MEAN = 0.2       # Stop once every chamber still in play has a posterior mean below this
 AUTO_HOME = CHAMBER_MAP[0]      # Base the bot must always keep enough battery to return to
 AUTO_PHASE_COLORS = {'SCANNING': '#005580', 'NAVIGATING': '#b35c00', 'UPDATING BELIEF': '#6a3d9a',
                      'REWARD UPDATE': '#2e7d32', 'COMPLETE': '#5c5346'}
@@ -753,6 +753,9 @@ def run_autonomous_mission(phase_slot, detail_slot, table_slot):
             break
         active = bandit.active_arms()
         if active and all(bandit.mean(arm) < AUTO_EXHAUSTED_MEAN for arm in active):
+            log(f"AUTO [{cycle}]: every remaining chamber's posterior mean is below {AUTO_EXHAUSTED_MEAN} — "
+                f"returning to base")
+            return_to_base(cycle)
             end_reason = "search exhausted — no promising chambers remain"
             break
         cycle += 1
