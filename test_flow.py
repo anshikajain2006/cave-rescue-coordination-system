@@ -59,4 +59,17 @@ assert react_cmd.action == "deliver" and react_cmd.target_chamber == 5, react_cm
 assert trace[0]["type"] == "FALLBACK", trace
 print(f"PASS ReACT parser (no-key fallback): action={react_cmd.action}, target={react_cmd.target_chamber}")
 
+# Test 8: Autonomous mission building blocks — bandit updates and a Q-learning route
+import numpy as np
+from autonomous_mission import QLearningNavigator, ThompsonBandit
+bandit = ThompsonBandit(range(1, 10), np.random.default_rng(0))
+bandit.update(3, 1)
+bandit.update(5, 0)
+assert bandit.mean(3) > 0.5 > bandit.mean(5), bandit.table()
+nav = QLearningNavigator(cave, seed=0)
+q_route = nav.route((0,0), (17,2))
+assert q_route and q_route[0] == (0,0) and q_route[-1] == (17,2), q_route
+assert all(abs(a[0]-b[0]) + abs(a[1]-b[1]) == 1 for a, b in zip(q_route, q_route[1:])), "route not contiguous"
+print(f"PASS Autonomous mission: bandit reward update OK, Q-learning route to (17,2) in {len(q_route)-1} moves")
+
 print("\nAll systems checked. Ready for demo.")
